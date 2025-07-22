@@ -93,8 +93,8 @@ export async function catFactFetcherLogic(
   const data = await response.json();
 
   const toolResponse: CatFactFetcherResponse = {
-    fact: data.fact,
-    length: data.length,
+    fact: (data as any).fact,
+    length: (data as any).length,
     requestedMaxLength: params.maxLength,
     timestamp: new Date().toISOString(),
   };

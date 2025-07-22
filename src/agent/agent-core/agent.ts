@@ -459,9 +459,7 @@ Begin the task. Your response must be only the JSON object.`;
 
       logger.logInteraction("McpToolResponse", {
         context,
-        toolName,
-        serverName,
-        result: toolResult,
+        response: { toolName, serverName, result: toolResult },
       });
 
       return toolResult;

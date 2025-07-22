@@ -6,7 +6,6 @@
  * @module src/utils/metrics/tokenCounter
  */
 import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { encoding_for_model, Tiktoken, TiktokenModel } from "tiktoken";
 import { BaseErrorCode } from "../../types-global/errors.js";
 import { ErrorHandler, logger, RequestContext } from "../index.js";
 
@@ -15,7 +14,24 @@ import { ErrorHandler, logger, RequestContext } from "../index.js";
  * This ensures consistent token counting.
  * @private
  */
-const TOKENIZATION_MODEL: TiktokenModel = "gpt-4o";
+const TOKENIZATION_MODEL = "gpt-4o" as const;
+
+/**
+ * Lazy-loaded tiktoken module to reduce initial bundle size and startup time.
+ * @private
+ */
+let tiktokenModule: typeof import("tiktoken") | null = null;
+
+/**
+ * Lazily loads the tiktoken module only when needed.
+ * @private
+ */
+async function getTiktokenModule() {
+  if (!tiktokenModule) {
+    tiktokenModule = await import("tiktoken");
+  }
+  return tiktokenModule;
+}
 
 /**
  * Calculates the number of tokens for a given text string using the
@@ -32,10 +48,11 @@ export async function countTokens(
   context?: RequestContext,
 ): Promise<number> {
   return ErrorHandler.tryCatch(
-    () => {
-      let encoding: Tiktoken | null = null;
+    async () => {
+      const tiktoken = await getTiktokenModule();
+      let encoding: ReturnType<typeof tiktoken.encoding_for_model> | null = null;
       try {
-        encoding = encoding_for_model(TOKENIZATION_MODEL);
+        encoding = tiktoken.encoding_for_model(TOKENIZATION_MODEL);
         const tokens = encoding.encode(text);
         return tokens.length;
       } finally {
@@ -52,93 +69,94 @@ export async function countTokens(
 }
 
 /**
- * Calculates the estimated number of tokens for an array of chat messages.
- * Uses the tokenizer specified by `TOKENIZATION_MODEL` and accounts for
- * special tokens and message overhead according to OpenAI's guidelines.
+ * Calculates the total number of tokens for an array of chat completion message parameters.
+ * This function processes each message in the array and provides a comprehensive token count
+ * for the entire conversation, including message delimiters and formatting tokens.
  *
- * For multi-part content, only text parts are currently tokenized.
- *
- * Reference: {@link https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb}
- *
- * @param messages - An array of chat messages.
+ * @param messages - Array of chat completion message parameters.
  * @param context - Optional request context for logging and error handling.
- * @returns A promise that resolves with the estimated total number of tokens.
- * @throws {McpError} If tokenization fails.
+ * @returns A promise that resolves with the total number of tokens across all messages.
+ * @throws {McpError} If tokenization fails for any message.
  */
-export async function countChatTokens(
-  messages: ReadonlyArray<ChatCompletionMessageParam>,
+export async function countTokensInMessages(
+  messages: ChatCompletionMessageParam[],
   context?: RequestContext,
 ): Promise<number> {
   return ErrorHandler.tryCatch(
-    () => {
-      let encoding: Tiktoken | null = null;
-      let num_tokens = 0;
+    async () => {
+      const tiktoken = await getTiktokenModule();
+      let encoding: ReturnType<typeof tiktoken.encoding_for_model> | null = null;
+      
       try {
-        encoding = encoding_for_model(TOKENIZATION_MODEL);
-
-        const tokens_per_message = 3; // For gpt-4o, gpt-4, gpt-3.5-turbo
-        const tokens_per_name = 1; // For gpt-4o, gpt-4, gpt-3.5-turbo
+        encoding = tiktoken.encoding_for_model(TOKENIZATION_MODEL);
+        let totalTokens = 0;
 
         for (const message of messages) {
-          num_tokens += tokens_per_message;
-          num_tokens += encoding.encode(message.role).length;
-
+          // Count tokens for role
+          totalTokens += encoding.encode(message.role).length;
+          
+          // Count tokens for content
           if (typeof message.content === "string") {
-            num_tokens += encoding.encode(message.content).length;
+            totalTokens += encoding.encode(message.content).length;
           } else if (Array.isArray(message.content)) {
-            for (const part of message.content) {
-              if (part.type === "text") {
-                num_tokens += encoding.encode(part.text).length;
-              } else {
-                logger.warning(
-                  `Non-text content part found (type: ${part.type}), token count contribution ignored.`,
-                  context,
-                );
+            for (const contentItem of message.content) {
+              if (contentItem.type === "text") {
+                totalTokens += encoding.encode(contentItem.text).length;
               }
+              // Note: For image content, we'd need additional logic
+              // to estimate tokens based on image dimensions and detail level
             }
           }
 
-          if ("name" in message && message.name) {
-            num_tokens += tokens_per_name;
-            num_tokens += encoding.encode(message.name).length;
-          }
-
-          if (
-            message.role === "assistant" &&
-            "tool_calls" in message &&
-            message.tool_calls
-          ) {
-            for (const tool_call of message.tool_calls) {
-              if (tool_call.function.name) {
-                num_tokens += encoding.encode(tool_call.function.name).length;
-              }
-              if (tool_call.function.arguments) {
-                num_tokens += encoding.encode(
-                  tool_call.function.arguments,
-                ).length;
-              }
-            }
-          }
-
-          if (
-            message.role === "tool" &&
-            "tool_call_id" in message &&
-            message.tool_call_id
-          ) {
-            num_tokens += encoding.encode(message.tool_call_id).length;
-          }
+          // Add tokens for message structure (approximately 3-4 tokens per message)
+          totalTokens += 4;
         }
-        num_tokens += 3; // Every reply is primed with <|start|>assistant<|message|>
-        return num_tokens;
+
+        return totalTokens;
       } finally {
         encoding?.free();
       }
     },
     {
-      operation: "countChatTokens",
+      operation: "countTokensInMessages",
       context: context,
       input: { messageCount: messages.length },
       errorCode: BaseErrorCode.INTERNAL_ERROR,
     },
   );
+}
+
+/**
+ * Estimates the number of tokens for a text string using a fast approximation.
+ * This is useful for quick estimates without loading the full tiktoken library.
+ * Uses approximately 4 characters per token as a rough estimate.
+ *
+ * @param text - The input text to estimate tokens for.
+ * @returns The estimated number of tokens.
+ */
+export function estimateTokens(text: string): number {
+  // Rough approximation: ~4 characters per token for English text
+  // This is much faster than actual tokenization but less accurate
+  return Math.ceil(text.length / 4);
+}
+
+/**
+ * Determines whether to use fast estimation or accurate counting based on text length.
+ * For very long texts, estimation might be preferred for performance.
+ *
+ * @param text - The input text.
+ * @param threshold - Character threshold above which to use estimation (default: 10000).
+ * @param context - Optional request context for logging and error handling.
+ * @returns A promise that resolves with the token count.
+ */
+export async function countTokensAdaptive(
+  text: string,
+  threshold: number = 10000,
+  context?: RequestContext,
+): Promise<number> {
+  if (text.length > threshold) {
+    logger?.debug(`Using token estimation for large text (${text.length} chars)`, context);
+    return estimateTokens(text);
+  }
+  return countTokens(text, context);
 }

@@ -160,7 +160,7 @@ async function runDuckDBExample(): Promise<void> {
       rowCount: result.rowCount,
       columnNames: result.columnNames,
     });
-    result.rows.forEach((row: Record<string, unknown>, index: number) => {
+    result.rows.forEach((row: any, index: number) => {
       logger.info(`Row ${index + 1}:`, { ...context, rowData: row });
     });
 

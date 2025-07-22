@@ -1,9 +1,10 @@
 /**
  * @fileoverview Implements the DuckDB service for interacting with a DuckDB database.
+ * This service provides a high-level interface for database operations including
+ * initialization, query execution, transaction management, and connection handling.
  * @module services/duck-db/duckDBService
  */
 
-import * as duckdb from "@duckdb/node-api";
 import { BaseErrorCode, McpError } from "../../types-global/errors.js";
 import {
   ErrorHandler,
@@ -11,166 +12,195 @@ import {
   RequestContext,
   requestContextService,
 } from "../../utils/index.js";
-import { DuckDBConnectionManager } from "./duckDBConnectionManager.js";
-import { DuckDBQueryExecutor } from "./duckDBQueryExecutor.js";
 import {
   DuckDBQueryResult,
   DuckDBServiceConfig,
   IDuckDBService,
 } from "./types.js";
 
+/**
+ * Lazy-loaded DuckDB module to reduce initial bundle size and startup time.
+ * @private
+ */
+let duckdbModule: typeof import("@duckdb/node-api") | null = null;
+
+/**
+ * Lazy-loaded connection manager to defer heavy initialization.
+ * @private
+ */
+let DuckDBConnectionManagerClass: typeof import("./duckDBConnectionManager.js").DuckDBConnectionManager | null = null;
+
+/**
+ * Lazy-loaded query executor to defer heavy initialization.
+ * @private
+ */
+let DuckDBQueryExecutorClass: typeof import("./duckDBQueryExecutor.js").DuckDBQueryExecutor | null = null;
+
+/**
+ * Lazily loads the DuckDB module and related classes only when needed.
+ * @private
+ */
+async function loadDuckDBModules() {
+  if (!duckdbModule) {
+    const [duckdb, { DuckDBConnectionManager }, { DuckDBQueryExecutor }] = await Promise.all([
+      import("@duckdb/node-api"),
+      import("./duckDBConnectionManager.js"),
+      import("./duckDBQueryExecutor.js")
+    ]);
+    
+    duckdbModule = duckdb;
+    DuckDBConnectionManagerClass = DuckDBConnectionManager;
+    DuckDBQueryExecutorClass = DuckDBQueryExecutor;
+  }
+  
+  return {
+    duckdb: duckdbModule,
+    DuckDBConnectionManager: DuckDBConnectionManagerClass!,
+    DuckDBQueryExecutor: DuckDBQueryExecutorClass!
+  };
+}
+
 export class DuckDBService implements IDuckDBService {
-  private connectionManager: DuckDBConnectionManager;
-  private queryExecutor: DuckDBQueryExecutor | null = null;
-  private isInitialized = false;
+  private connectionManager: any = null;
+  private queryExecutor: any = null;
+  private initialized = false;
 
   constructor() {
-    this.connectionManager = new DuckDBConnectionManager();
+    // Defer initialization until needed
   }
 
   async initialize(config?: DuckDBServiceConfig): Promise<void> {
     const context = requestContextService.createRequestContext({
       operation: "DuckDBService.initialize",
-      initialData: config,
     });
 
-    if (this.isInitialized) {
-      logger.warning(
+    if (this.initialized) {
+      throw new McpError(
+        BaseErrorCode.INITIALIZATION_FAILED,
         "DuckDBService already initialized. Close first to re-initialize.",
         context,
       );
-      return;
     }
 
-    return ErrorHandler.tryCatch(
+    await ErrorHandler.tryCatch(
       async () => {
-        await this.connectionManager.initialize(config);
-        const connection = this.connectionManager.getConnection();
+        const { DuckDBConnectionManager, DuckDBQueryExecutor } = await loadDuckDBModules();
+        
+        this.connectionManager = new DuckDBConnectionManager();
+        const connection = await this.connectionManager.initialize(config);
         this.queryExecutor = new DuckDBQueryExecutor(connection);
-        this.isInitialized = true;
+        this.initialized = true;
+
         logger.info("DuckDBService initialized successfully.", context);
       },
       {
         operation: "DuckDBService.initialize",
         context,
-        input: config,
         errorCode: BaseErrorCode.INITIALIZATION_FAILED,
         critical: true,
       },
     );
   }
 
-  private ensureInitialized(context: RequestContext): void {
-    this.connectionManager.ensureInitialized(context); // Delegate to manager
-    if (!this.queryExecutor) {
-      // This check is mostly for type safety, as connectionManager.ensureInitialized should cover it
+  private ensureInitialized(): void {
+    if (!this.initialized || !this.queryExecutor) {
       throw new McpError(
-        BaseErrorCode.SERVICE_NOT_INITIALIZED,
+        BaseErrorCode.INITIALIZATION_FAILED,
         "DuckDBQueryExecutor not available. DuckDBService may not be fully initialized.",
-        context,
       );
     }
   }
 
-  private validateParams(
-    params: unknown,
-    context: RequestContext,
-  ): duckdb.DuckDBValue[] | undefined {
-    if (params === undefined) {
-      return undefined;
-    }
+  private normalizeParams(
+    params?: unknown[] | Record<string, unknown>,
+  ): any {
+    if (!params) return undefined;
     if (Array.isArray(params)) {
-      return params as duckdb.DuckDBValue[];
+      return params;
     }
     throw new McpError(
-      BaseErrorCode.INVALID_INPUT,
+      BaseErrorCode.INTERNAL_ERROR,
       "DuckDB service only supports array-style parameters, not named objects.",
-      context,
     );
   }
 
   async run(
     sql: string,
-    params?: unknown[],
+    params?: unknown[] | Record<string, unknown>,
   ): Promise<void> {
+    this.ensureInitialized();
     const context = requestContextService.createRequestContext({
       operation: "DuckDBService.run",
-      initialData: { sql, params },
     });
-    this.ensureInitialized(context);
-    const validatedParams = this.validateParams(params, context);
-    return this.queryExecutor!.run(sql, validatedParams);
+    
+    const normalizedParams = this.normalizeParams(params);
+    return this.queryExecutor!.run(sql, normalizedParams, context);
   }
 
-  async query<T = Record<string, unknown>>(
+  async query<T = unknown>(
     sql: string,
-    params?: unknown[],
+    params?: unknown[] | Record<string, unknown>,
   ): Promise<DuckDBQueryResult<T>> {
+    this.ensureInitialized();
     const context = requestContextService.createRequestContext({
       operation: "DuckDBService.query",
-      initialData: { sql, params },
     });
-    this.ensureInitialized(context);
-    const validatedParams = this.validateParams(params, context);
-    return this.queryExecutor!.query<T>(sql, validatedParams);
+    
+    const normalizedParams = this.normalizeParams(params);
+    return this.queryExecutor!.query(sql, normalizedParams, context);
   }
 
   async stream(
     sql: string,
-    params?: unknown[],
-  ): Promise<duckdb.DuckDBResult> {
+    params?: unknown[] | Record<string, unknown>,
+  ): Promise<any> {
+    this.ensureInitialized();
     const context = requestContextService.createRequestContext({
       operation: "DuckDBService.stream",
-      initialData: { sql, params },
     });
-    this.ensureInitialized(context);
-    const validatedParams = this.validateParams(params, context);
-    return this.queryExecutor!.stream(sql, validatedParams);
+    
+    const normalizedParams = this.normalizeParams(params);
+    return this.queryExecutor!.stream(sql, normalizedParams, context);
   }
 
-  async prepare(sql: string): Promise<duckdb.DuckDBPreparedStatement> {
+  async prepare(sql: string): Promise<any> {
+    this.ensureInitialized();
     const context = requestContextService.createRequestContext({
       operation: "DuckDBService.prepare",
-      initialData: { sql },
     });
-    this.ensureInitialized(context);
-    return this.queryExecutor!.prepare(sql);
+    return this.queryExecutor!.prepare(sql, context);
   }
 
   async beginTransaction(): Promise<void> {
+    this.ensureInitialized();
     const context = requestContextService.createRequestContext({
       operation: "DuckDBService.beginTransaction",
     });
-    this.ensureInitialized(context);
-    return this.queryExecutor!.beginTransaction();
+    return this.queryExecutor!.beginTransaction(context);
   }
 
   async commitTransaction(): Promise<void> {
+    this.ensureInitialized();
     const context = requestContextService.createRequestContext({
       operation: "DuckDBService.commitTransaction",
     });
-    this.ensureInitialized(context);
-    return this.queryExecutor!.commitTransaction();
+    return this.queryExecutor!.commitTransaction(context);
   }
 
   async rollbackTransaction(): Promise<void> {
+    this.ensureInitialized();
     const context = requestContextService.createRequestContext({
       operation: "DuckDBService.rollbackTransaction",
     });
-    this.ensureInitialized(context);
-    return this.queryExecutor!.rollbackTransaction();
+    return this.queryExecutor!.rollbackTransaction(context);
   }
 
-  async loadExtension(extensionName: string): Promise<void> {
+  async loadExtension(extensionName: string, repositoryPath?: string): Promise<void> {
+    this.ensureInitialized();
     const context = requestContextService.createRequestContext({
       operation: "DuckDBService.loadExtension",
-      initialData: { extensionName },
     });
-    // ensureInitialized is implicitly called by connectionManager.loadExtension
-    // if we call ensureInitialized here, it uses the service's context,
-    // but loadExtension in manager will create its own.
-    // It's better to let the manager handle its own initialization checks.
-    return this.connectionManager.loadExtension(extensionName, context);
+    return this.queryExecutor!.loadExtension(extensionName, repositoryPath, context);
   }
 
   async close(): Promise<void> {
@@ -178,33 +208,32 @@ export class DuckDBService implements IDuckDBService {
       operation: "DuckDBService.close",
     });
 
-    // No need to check this.isInitialized here, connectionManager.close() handles it.
-    return ErrorHandler.tryCatch(
+    await ErrorHandler.tryCatch(
       async () => {
-        await this.connectionManager.close();
-        this.queryExecutor = null;
-        this.isInitialized = false;
+        if (this.queryExecutor) {
+          await this.queryExecutor.close();
+          this.queryExecutor = null;
+        }
+        if (this.connectionManager) {
+          await this.connectionManager.close();
+          this.connectionManager = null;
+        }
+        this.initialized = false;
         logger.info("DuckDBService closed successfully.", context);
       },
       {
         operation: "DuckDBService.close",
         context,
-        errorCode: BaseErrorCode.SHUTDOWN_ERROR,
+        errorCode: BaseErrorCode.INTERNAL_ERROR,
       },
     );
   }
 
-  getRawConnection(): duckdb.DuckDBConnection | null {
-    if (this.connectionManager.isServiceInitialized) {
-      return this.connectionManager.getConnection();
-    }
-    return null;
+  getRawConnection(): any {
+    return this.connectionManager?.getRawConnection() || null;
   }
 
-  getRawInstance(): duckdb.DuckDBInstance | null {
-    if (this.connectionManager.isServiceInitialized) {
-      return this.connectionManager.getInstance();
-    }
-    return null;
+  getRawInstance(): any {
+    return this.connectionManager?.getRawInstance() || null;
   }
 }

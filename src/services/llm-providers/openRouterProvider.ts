@@ -5,14 +5,6 @@
  * execute the core API interactions and throw structured errors.
  * @module src/services/llm-providers/openRouterProvider
  */
-import OpenAI from "openai";
-import {
-  ChatCompletion,
-  ChatCompletionChunk,
-  ChatCompletionCreateParamsNonStreaming,
-  ChatCompletionCreateParamsStreaming,
-} from "openai/resources/chat/completions";
-import { Stream } from "openai/streaming";
 import { config } from "../../config/index.js";
 import { BaseErrorCode, McpError } from "../../types-global/errors.js";
 import { ErrorHandler } from "../../utils/internal/errorHandler.js";
@@ -23,6 +15,23 @@ import {
 } from "../../utils/internal/requestContext.js";
 import { rateLimiter } from "../../utils/security/rateLimiter.js";
 import { sanitization } from "../../utils/security/sanitization.js";
+
+/**
+ * Lazy-loaded OpenAI module to reduce initial bundle size and startup time.
+ * @private
+ */
+let openaiModule: typeof import("openai") | null = null;
+
+/**
+ * Lazily loads the OpenAI module only when needed.
+ * @private
+ */
+async function getOpenAIModule() {
+  if (!openaiModule) {
+    openaiModule = await import("openai");
+  }
+  return openaiModule;
+}
 
 // Note: OpenRouter recommends setting HTTP-Referer (e.g., config.openrouterAppUrl)
 // and X-Title (e.g., config.openrouterAppName) headers.
@@ -41,302 +50,219 @@ export interface OpenRouterClientOptions {
  * Defines the parameters for an OpenRouter chat completion request.
  */
 export type OpenRouterChatParams = (
-  | ChatCompletionCreateParamsNonStreaming
-  | ChatCompletionCreateParamsStreaming
+  | import("openai/resources/chat/completions").ChatCompletionCreateParamsNonStreaming
+  | import("openai/resources/chat/completions").ChatCompletionCreateParamsStreaming
 ) & {
   top_k?: number;
   min_p?: number;
   transforms?: string[];
   models?: string[];
   route?: "fallback";
-  provider?: Record<string, unknown>;
 };
 
-// #region Internal Logic Functions (Throwing Errors)
-
 /**
- * Prepares parameters for the OpenRouter API call, separating standard
- * and extra parameters and applying defaults.
- * @internal
+ * Service class for interacting with the OpenRouter API.
+ * Provides methods for chat completions with streaming and non-streaming options.
  */
-function _prepareApiParameters(params: OpenRouterChatParams) {
-  const effectiveModelId = params.model || config.llmDefaultModel;
+export class OpenRouterProvider {
+  private client: InstanceType<typeof import("openai").default> | null = null;
+  private readonly options: OpenRouterClientOptions;
 
-  const standardParams: Partial<
-    ChatCompletionCreateParamsStreaming | ChatCompletionCreateParamsNonStreaming
-  > = {
-    model: effectiveModelId,
-    messages: params.messages,
-    ...(params.temperature !== undefined ||
-    config.llmDefaultTemperature !== undefined
-      ? { temperature: params.temperature ?? config.llmDefaultTemperature }
-      : {}),
-    ...(params.top_p !== undefined || config.llmDefaultTopP !== undefined
-      ? { top_p: params.top_p ?? config.llmDefaultTopP }
-      : {}),
-    ...(params.presence_penalty !== undefined
-      ? { presence_penalty: params.presence_penalty }
-      : {}),
-    ...(params.stream !== undefined && { stream: params.stream }),
-    ...(params.tools !== undefined && { tools: params.tools }),
-    ...(params.tool_choice !== undefined && {
-      tool_choice: params.tool_choice,
-    }),
-    ...(params.response_format !== undefined && {
-      response_format: params.response_format,
-    }),
-    ...(params.stop !== undefined && { stop: params.stop }),
-    ...(params.seed !== undefined && { seed: params.seed }),
-    ...(params.frequency_penalty !== undefined
-      ? { frequency_penalty: params.frequency_penalty }
-      : {}),
-    ...(params.logit_bias !== undefined && { logit_bias: params.logit_bias }),
-  };
-
-  const extraBody: Record<string, unknown> = {};
-  const standardKeys = new Set(Object.keys(standardParams));
-  standardKeys.add("messages");
-
-  for (const key in params) {
-    if (
-      Object.prototype.hasOwnProperty.call(params, key) &&
-      !standardKeys.has(key) &&
-      key !== "max_tokens"
-    ) {
-      extraBody[key] = (params as unknown as Record<string, unknown>)[key];
-    }
-  }
-
-  if (extraBody.top_k === undefined && config.llmDefaultTopK !== undefined) {
-    extraBody.top_k = config.llmDefaultTopK;
-  }
-  if (extraBody.min_p === undefined && config.llmDefaultMinP !== undefined) {
-    extraBody.min_p = config.llmDefaultMinP;
-  }
-  if (
-    extraBody.provider &&
-    typeof extraBody.provider === "object" &&
-    extraBody.provider !== null
-  ) {
-    const provider = extraBody.provider as Record<string, unknown>;
-    if (!provider.sort) {
-      provider.sort = "throughput";
-    }
-  } else if (extraBody.provider === undefined) {
-    extraBody.provider = { sort: "throughput" };
-  }
-
-  const modelsRequiringMaxCompletionTokens = ["openai/o1", "openai/gpt-4.1"];
-  const needsMaxCompletionTokens = modelsRequiringMaxCompletionTokens.some(
-    (modelPrefix) => effectiveModelId.startsWith(modelPrefix),
-  );
-  const effectiveMaxTokensValue =
-    params.max_tokens ?? config.llmDefaultMaxTokens;
-
-  if (effectiveMaxTokensValue !== undefined) {
-    if (needsMaxCompletionTokens) {
-      extraBody.max_completion_tokens = effectiveMaxTokensValue;
-    } else {
-      standardParams.max_tokens = effectiveMaxTokensValue;
-    }
-  }
-
-  return { standardParams, extraBody };
-}
-
-async function _openRouterChatCompletionLogic(
-  client: OpenAI,
-  params: OpenRouterChatParams,
-  context: RequestContext,
-): Promise<ChatCompletion | Stream<ChatCompletionChunk>> {
-  const isStreaming = params.stream === true;
-
-  const { standardParams, extraBody } = _prepareApiParameters(params);
-
-  const apiParams = { ...standardParams };
-  if (Object.keys(extraBody).length > 0) {
-    (apiParams as Record<string, unknown>).extra_body = extraBody;
-  }
-
-  logger.logInteraction("OpenRouterRequest", {
-    context,
-    request: apiParams,
-  });
-
-  try {
-    if (isStreaming) {
-      return await client.chat.completions.create(
-        apiParams as unknown as ChatCompletionCreateParamsStreaming,
-      );
-    }
-    const response = await client.chat.completions.create(
-      apiParams as unknown as ChatCompletionCreateParamsNonStreaming,
-    );
-
-    logger.logInteraction("OpenRouterResponse", {
-      context,
-      response,
-      streaming: false,
-    });
-
-    return response;
-  } catch (e: unknown) {
-    const error = e as Error & { status?: number; cause?: unknown };
-    logger.logInteraction("OpenRouterError", {
-      context,
-      error: {
-        message: error.message,
-        stack: error.stack,
-        status: error.status,
-        cause: error.cause,
-      },
-    });
-    const errorDetails = {
-      providerStatus: error.status,
-      providerMessage: error.message,
-      cause: error?.cause,
+  constructor(options: OpenRouterClientOptions = {}) {
+    this.options = {
+      apiKey: options.apiKey || config.openrouterApiKey,
+      baseURL: options.baseURL || "https://openrouter.ai/api/v1",
+      siteUrl: options.siteUrl || config.openrouterAppUrl,
+      siteName: options.siteName || config.openrouterAppName,
+      ...options,
     };
-    if (error.status === 401) {
-      throw new McpError(
-        BaseErrorCode.UNAUTHORIZED,
-        `OpenRouter authentication failed: ${error.message}`,
-        errorDetails,
-      );
-    } else if (error.status === 429) {
-      throw new McpError(
-        BaseErrorCode.RATE_LIMITED,
-        `OpenRouter rate limit exceeded: ${error.message}`,
-        errorDetails,
-      );
-    } else if (error.status === 402) {
-      throw new McpError(
-        BaseErrorCode.FORBIDDEN,
-        `OpenRouter insufficient credits or payment required: ${error.message}`,
-        errorDetails,
-      );
-    }
-    throw new McpError(
-      BaseErrorCode.INTERNAL_ERROR,
-      `OpenRouter API error (${error.status || "unknown status"}): ${
-        error.message
-      }`,
-      errorDetails,
-    );
-  }
-}
-
-class OpenRouterProvider {
-  private client?: OpenAI;
-  public status: "unconfigured" | "initializing" | "ready" | "error";
-  private initializationError: Error | null = null;
-
-  constructor() {
-    this.status = "unconfigured";
   }
 
-  public initialize(options?: OpenRouterClientOptions): void {
-    const opContext = requestContextService.createRequestContext({
-      operation: "OpenRouterProvider.initialize",
-    });
-    this.status = "initializing";
+  /**
+   * Lazily initializes the OpenAI client when needed.
+   * @private
+   */
+  private async ensureClient(): Promise<InstanceType<typeof import("openai").default>> {
+    if (!this.client) {
+      const OpenAI = await getOpenAIModule();
+      
+      if (!this.options.apiKey) {
+        throw new McpError(
+          BaseErrorCode.CONFIGURATION_ERROR,
+          "OpenRouter API key is required but not provided in configuration or options.",
+        );
+      }
 
-    const apiKey = options?.apiKey || config.openrouterApiKey;
-    if (!apiKey) {
-      this.status = "unconfigured";
-      this.initializationError = new McpError(
-        BaseErrorCode.CONFIGURATION_ERROR,
-        "OpenRouter API key is not configured.",
-      );
-      logger.error(this.initializationError.message, opContext);
-      return;
-    }
-
-    try {
-      this.client = new OpenAI({
-        baseURL: options?.baseURL || "https://openrouter.ai/api/v1",
-        apiKey,
+      this.client = new OpenAI.default({
+        apiKey: this.options.apiKey,
+        baseURL: this.options.baseURL,
         defaultHeaders: {
-          "HTTP-Referer": options?.siteUrl || config.openrouterAppUrl,
-          "X-Title": options?.siteName || config.openrouterAppName,
+          ...(this.options.siteUrl && { "HTTP-Referer": this.options.siteUrl }),
+          ...(this.options.siteName && { "X-Title": this.options.siteName }),
         },
       });
-      this.status = "ready";
-      logger.info("OpenRouter Service Initialized and Ready", opContext);
-    } catch (e: unknown) {
-      const error = e as Error;
-      this.status = "error";
-      this.initializationError = error;
-      logger.error("Failed to initialize OpenRouter client", {
-        ...opContext,
-        error: error.message,
-      });
     }
+    return this.client;
   }
 
-  private checkReady(operation: string, context: RequestContext): void {
-    if (this.status !== "ready" || !this.client) {
-      const message = `OpenRouter service is not available (status: ${this.status}).`;
-      logger.error(`[${operation}] ${message}`, {
-        ...context,
-        status: this.status,
-      });
-      throw new McpError(BaseErrorCode.SERVICE_UNAVAILABLE, message, {
-        cause: this.initializationError,
-      });
-    }
-  }
+  /**
+   * Creates a chat completion request to OpenRouter.
+   * Supports both streaming and non-streaming responses.
+   *
+   * @param params - The chat completion parameters.
+   * @param context - Optional request context for logging and error handling.
+   * @returns A promise that resolves to either a ChatCompletion or Stream based on the stream parameter.
+   * @throws {McpError} If the request fails or parameters are invalid.
+   */
+  async createChatCompletion<T extends OpenRouterChatParams>(
+    params: T,
+    context?: RequestContext,
+  ): Promise<
+    T extends { stream: true }
+      ? import("openai/streaming").Stream<import("openai/resources/chat/completions").ChatCompletionChunk>
+      : import("openai/resources/chat/completions").ChatCompletion
+  > {
+    const operationContext = context || requestContextService.createRequestContext({
+      operation: "OpenRouterProvider.createChatCompletion",
+    });
 
-  public async chatCompletion(
-    params: OpenRouterChatParams,
-    context: RequestContext,
-  ): Promise<ChatCompletion | Stream<ChatCompletionChunk>> {
-    const operation = "OpenRouterProvider.chatCompletion";
-    const sanitizedParams = sanitization.sanitizeForLogging(params);
-
-    return await ErrorHandler.tryCatch(
+    return ErrorHandler.tryCatch(
       async () => {
-        this.checkReady(operation, context);
-        const rateLimitKey = context.requestId || "openrouter_default_key";
-        rateLimiter.check(rateLimitKey, context);
-        return await _openRouterChatCompletionLogic(
-          this.client!,
-          params,
-          context,
-        );
+        // Rate limiting
+        await rateLimiter.check("openrouter", operationContext);
+
+        // Input sanitization
+        const sanitizedParams = await this.sanitizeParams(params, operationContext);
+
+        // Get the client (lazy initialization)
+        const client = await this.ensureClient();
+
+        // Make the API call
+        const result = await client.chat.completions.create(sanitizedParams as any);
+
+        logger.info("OpenRouter chat completion request successful.", {
+          ...operationContext,
+          model: params.model,
+          streaming: params.stream ?? false,
+        });
+
+        return result as any;
       },
-      { operation, context, input: sanitizedParams },
+      {
+        operation: "OpenRouterProvider.createChatCompletion",
+        context: operationContext,
+        input: {
+          model: params.model,
+          messageCount: params.messages?.length,
+          streaming: params.stream ?? false,
+        },
+        errorCode: BaseErrorCode.INTERNAL_ERROR,
+      },
     );
   }
 
-  public async chatCompletionStream(
+  /**
+   * Sanitizes the input parameters for the chat completion request.
+   * @private
+   */
+  private async sanitizeParams(
     params: OpenRouterChatParams,
     context: RequestContext,
-  ): Promise<AsyncIterable<ChatCompletionChunk>> {
-    const streamParams = { ...params, stream: true };
-    const response = await this.chatCompletion(streamParams, context);
-    const responseStream = response as Stream<ChatCompletionChunk>;
-
-    async function* loggingStream(): AsyncGenerator<ChatCompletionChunk> {
-      const chunks: ChatCompletionChunk[] = [];
-      try {
-        for await (const chunk of responseStream) {
-          chunks.push(chunk);
-          yield chunk;
+  ): Promise<OpenRouterChatParams> {
+    return ErrorHandler.tryCatch(
+      async () => {
+        // Validate required fields
+        if (!params.model) {
+          throw new McpError(
+            BaseErrorCode.INTERNAL_ERROR,
+            "Model parameter is required for chat completion.",
+            context,
+          );
         }
-      } finally {
-        logger.logInteraction("OpenRouterResponse", {
-          context,
-          response: chunks,
-          streaming: true,
-        });
-      }
-    }
 
-    return loggingStream();
+        if (!params.messages || !Array.isArray(params.messages) || params.messages.length === 0) {
+          throw new McpError(
+            BaseErrorCode.INTERNAL_ERROR,
+            "Messages array is required and must contain at least one message.",
+            context,
+          );
+        }
+
+        // Sanitize string parameters
+        const sanitizedParams: OpenRouterChatParams = {
+          ...params,
+          model: await sanitization.sanitizeString(params.model, { context: "text" }),
+        };
+
+        // Sanitize message contents
+        if (sanitizedParams.messages) {
+          sanitizedParams.messages = await Promise.all(
+            sanitizedParams.messages.map(async (message) => {
+              const sanitizedMessage = { ...message };
+              
+              if (typeof message.content === "string") {
+                sanitizedMessage.content = await sanitization.sanitizeString(
+                  message.content,
+                  { context: "text" },
+                );
+              } else if (Array.isArray(message.content)) {
+                sanitizedMessage.content = message.content as any;
+              }
+              
+              return sanitizedMessage;
+            }),
+          );
+        }
+
+        return sanitizedParams;
+      },
+      {
+        operation: "OpenRouterProvider.sanitizeParams",
+        context,
+        errorCode: BaseErrorCode.INTERNAL_ERROR,
+      },
+    );
+  }
+
+  /**
+   * Gets the underlying OpenAI client instance.
+   * Initializes the client if not already done.
+   * @returns The OpenAI client instance.
+   */
+  async getClient(): Promise<InstanceType<typeof import("openai").default>> {
+    return this.ensureClient();
+  }
+
+  /**
+   * Checks if the provider is configured with required credentials.
+   * @returns True if the provider has the necessary configuration.
+   */
+  isConfigured(): boolean {
+    return !!(this.options.apiKey && this.options.baseURL);
+  }
+
+  /**
+   * Legacy initialize method for backward compatibility.
+   * This is a no-op since initialization is now lazy.
+   */
+  initialize(): void {
+    // No-op for backward compatibility
+  }
+
+  /**
+   * Legacy streaming method for backward compatibility.
+   * Creates a streaming chat completion.
+   */
+  async chatCompletionStream(
+    params: OpenRouterChatParams,
+    context?: RequestContext,
+  ): Promise<any> {
+    const streamParams = { ...params, stream: true };
+    return this.createChatCompletion(streamParams, context);
   }
 }
 
-const openRouterProviderInstance = new OpenRouterProvider();
-
-export { openRouterProviderInstance as openRouterProvider };
-export type { OpenRouterProvider };
+/**
+ * Default OpenRouter provider instance using configuration values.
+ */
+export const openRouterProvider = new OpenRouterProvider();

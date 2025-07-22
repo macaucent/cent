@@ -21,18 +21,22 @@
   },
   "homepage": "https://github.com/cyanheads/mcp-ts-template#readme",
   "scripts": {
-    "build": "tsc && node --loader ts-node/esm scripts/make-executable.ts dist/index.js",
+    "build": "npm run clean && tsc && node scripts/make-executable.js",
+    "build:production": "npm run clean && tsc --build && npm run minify",
     "start": "node dist/index.js",
     "start:stdio": "MCP_LOG_LEVEL=debug MCP_TRANSPORT_TYPE=stdio node dist/index.js",
     "start:http": "MCP_LOG_LEVEL=debug MCP_TRANSPORT_TYPE=http node dist/index.js",
     "start:agent": "MCP_LOG_LEVEL=debug node dist/agent/cli/boot.js",
-    "rebuild": "ts-node --esm scripts/clean.ts && npm run build",
+    "clean": "npx tsx scripts/clean.ts",
+    "rebuild": "npm run clean && npm run build",
+    "minify": "node scripts/minify.js",
+    "analyze-bundle": "node scripts/analyze-bundle.js",
     "docs:generate": "typedoc --tsconfig ./tsconfig.typedoc.json",
     "depcheck": "npx depcheck",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "tree": "ts-node --esm scripts/tree.ts",
-    "fetch-spec": "ts-node --esm scripts/fetch-openapi-spec.ts",
+    "tree": "npx tsx scripts/tree.ts",
+    "fetch-spec": "npx tsx scripts/fetch-openapi-spec.ts",
     "format": "prettier --write \"**/*.{ts,js,json,md,html,css}\"",
     "inspector": "npx mcp-inspector --config mcp.json --server mcp-ts-template",
     "db:duckdb-example": "MCP_LOG_LEVEL=debug tsc && node dist/storage/duckdbExample.js"
@@ -110,8 +114,11 @@
     "@types/node-cron": "^3.0.11",
     "axios": "^1.10.0",
     "depcheck": "^1.4.7",
+    "glob": "^11.0.3",
     "globals": "^16.3.0",
     "prettier": "^3.6.2",
+    "terser": "^5.43.1",
+    "tsx": "^4.20.3",
     "typedoc": "^0.28.7"
   }
 }
