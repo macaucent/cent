@@ -231,9 +231,13 @@ Begin the task. Your response must be only the JSON object.`;
       while (true) {
         const llmParams: OpenRouterChatParams = {
           messages,
-          model: "google/gemini-2.5-flash",
+          model: config.llmDefaultModel || "google/gemini-2.5-flash",
           stream: true,
-          temperature: 0.4,
+          temperature: config.llmDefaultTemperature ?? 0.3,
+          max_tokens: config.llmDefaultMaxTokens ?? 2048,
+          top_p: config.llmDefaultTopP ?? 0.9,
+          top_k: config.llmDefaultTopK ?? 40,
+          min_p: config.llmDefaultMinP ?? 0.05,
         };
 
         const llmResponse = await this.think(
