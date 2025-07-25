@@ -211,7 +211,7 @@ async function _openRouterChatCompletionLogic(
     } else if (error.status === 402) {
       throw new McpError(
         BaseErrorCode.FORBIDDEN,
-        `OpenRouter insufficient credits or payment required: ${error.message}`,
+        `OpenRouter 요금 부족 또는 결제 필요: ${error.message}. 계정 잔액을 확인하고 결제를 완료해주세요.`,
         errorDetails,
       );
     }

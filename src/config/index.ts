@@ -129,20 +129,20 @@ const EnvSchema = z.object({
   OPENROUTER_APP_NAME: z.string().optional(),
   /** Optional. API key for OpenRouter services. */
   OPENROUTER_API_KEY: z.string().optional(),
-  /** Default LLM model. Default: "google/gemini-2.5-flash-preview-05-20". */
+  /** Default LLM model. Default: "google/gemini-2.5-flash" for better cost efficiency. */
   LLM_DEFAULT_MODEL: z
     .string()
-    .default("google/gemini-2.5-flash-preview-05-20"),
-  /** Optional. Default LLM temperature (0.0-2.0). */
-  LLM_DEFAULT_TEMPERATURE: z.coerce.number().min(0).max(2).optional(),
-  /** Optional. Default LLM top_p (0.0-1.0). */
-  LLM_DEFAULT_TOP_P: z.coerce.number().min(0).max(1).optional(),
-  /** Optional. Default LLM max tokens (positive integer). */
-  LLM_DEFAULT_MAX_TOKENS: z.coerce.number().int().positive().optional(),
-  /** Optional. Default LLM top_k (non-negative integer). */
-  LLM_DEFAULT_TOP_K: z.coerce.number().int().nonnegative().optional(),
-  /** Optional. Default LLM min_p (0.0-1.0). */
-  LLM_DEFAULT_MIN_P: z.coerce.number().min(0).max(1).optional(),
+    .default("google/gemini-2.5-flash"),
+  /** Optional. Default LLM temperature (0.0-2.0). Default: 0.3 for balanced performance and cost. */
+  LLM_DEFAULT_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.3),
+  /** Optional. Default LLM top_p (0.0-1.0). Default: 0.9 for good quality. */
+  LLM_DEFAULT_TOP_P: z.coerce.number().min(0).max(1).default(0.9),
+  /** Optional. Default LLM max tokens (positive integer). Default: 2048 for cost control. */
+  LLM_DEFAULT_MAX_TOKENS: z.coerce.number().int().positive().default(2048),
+  /** Optional. Default LLM top_k (non-negative integer). Default: 40 for quality control. */
+  LLM_DEFAULT_TOP_K: z.coerce.number().int().nonnegative().default(40),
+  /** Optional. Default LLM min_p (0.0-1.0). Default: 0.05 for quality threshold. */
+  LLM_DEFAULT_MIN_P: z.coerce.number().min(0).max(1).default(0.05),
 
   /** Optional. OAuth provider authorization endpoint URL. */
   OAUTH_PROXY_AUTHORIZATION_URL: z
